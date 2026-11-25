@@ -1,5 +1,5 @@
 // 오프라인에서도 앱이 열리도록 화면 파일을 휴대폰에 보관한다
-const V = 'fieldnote-v2';
+const V = 'fieldnote-v3';
 const CDN = ['https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js'];
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icon.svg', ...CDN];
 

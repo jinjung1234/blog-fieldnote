@@ -166,8 +166,10 @@ async function renderPost(id) {
 
       <section class="card">
         <h2>PC로 보내기</h2>
-        <button class="btn primary big" id="export">📦 블로그 패키지 내보내기</button>
-        <p class="small muted">ZIP 파일을 카카오톡 나에게 보내기·구글 드라이브 등으로 PC에 옮긴 뒤 Claude에게 "초안 만들어 줘"라고 하세요.</p>
+        <button class="btn primary big" id="drive">☁️ 구글 드라이브에 올리기</button>
+        ${p.drive ? `<p class="small ok">✓ 드라이브 '${DRIVE_FOLDER}'에 올림 (${esc(p.drive.at.slice(5, 16).replace('T', ' '))}, ${mb(p.drive.size)})</p>` : ''}
+        <p class="small muted">와이파이에서 누르세요. 드라이브 '${DRIVE_FOLDER}' 폴더에 ZIP으로 올라갑니다. PC에서 Claude에게 "초안 만들어 줘"라고 하면 됩니다.</p>
+        <button class="btn small" id="export">다른 방법: 휴대폰에 ZIP 저장</button>
         ${p.exported && !p.cleaned ? '<button class="btn danger" id="clean" style="width:100%">🧹 정리: 사진·영상 파일 지워 공간 확보 (글 기록은 남김)</button>' : ''}
         <button class="btn danger small" id="delPost" style="margin-top:10px">이 글 통째로 삭제</button>
       </section>
@@ -188,6 +190,8 @@ async function renderPost(id) {
   $$('[data-atext]').forEach(t => t.onchange = async () => { const c = await DB.get('media', t.dataset.atext); if (c) { c.text = t.value.trim(); await DB.put('media', c); } });
   $$('[data-adel]').forEach(b => b.onclick = async () => { if (confirm('이 녹음을 지울까요?')) { await DB.del('media', b.dataset.adel); render(); } });
   $('#export').onclick = () => exportPost(p.id);
+  $('#drive').onclick = () => driveSend(p.id);
+  loadGis().catch(() => {});
   if ($('#clean')) $('#clean').onclick = () => cleanPost(p.id);
   $('#delPost').onclick = async () => {
     if (!confirm(`"${p.place}" 글과 사진·녹음을 모두 지울까요? 되돌릴 수 없습니다.`)) return;
@@ -390,16 +394,17 @@ function requestMd(p, items, overall) {
   return L.join('\n') + '\n';
 }
 
-async function exportPost(id) {
-  if (!window.JSZip) return toast('ZIP 도구를 못 불러왔어요. 인터넷 연결 후 한 번 앱을 열어 주세요.', 4000);
+// ZIP 패키지를 만든다. 실패·취소면 null
+async function buildPackage(id) {
+  if (!window.JSZip) { toast('ZIP 도구를 못 불러왔어요. 인터넷 연결 후 한 번 앱을 열어 주세요.', 4000); return null; }
   const p = await DB.get('posts', id);
-  if (p.cleaned) return toast('이미 정리해서 파일이 없는 글이에요.');
+  if (p.cleaned) { toast('이미 정리해서 파일이 없는 글이에요.'); return null; }
   const all = await DB.mediaOf(id);
   const byId = Object.fromEntries(all.map(m => [m.id, m]));
   const order = (p.order || []).filter(x => byId[x]);
-  if (!order.length) return toast('찍은 사진이 없어요.');
+  if (!order.length) { toast('찍은 사진이 없어요.'); return null; }
   const total = order.reduce((s, x) => s + (byId[x].size || byId[x].blob.size), 0);
-  if (total > 400 * 1048576 && !confirm(`파일이 ${mb(total)}로 큽니다. 휴대폰에서 ZIP 만들기가 느리거나 실패할 수 있어요. 계속할까요?`)) return;
+  if (total > 400 * 1048576 && !confirm(`파일이 ${mb(total)}로 큽니다. 휴대폰에서 ZIP 만들기가 느리거나 실패할 수 있어요. 계속할까요?`)) return null;
   toast('패키지 만드는 중…', 60000);
   const zip = new JSZip();
   const items = order.map((mid, k) => {
@@ -424,11 +429,18 @@ async function exportPost(id) {
   // 사진·영상은 이미 압축된 파일이라 다시 압축하지 않는다 (휴대폰 부담 줄이기)
   const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
   const name = `${p.date}_${safeName(p.place)}_블로그패키지.zip`;
+  return { p, blob, name };
+}
+
+// 다른 방법: 공유창(되는 기기만) 또는 휴대폰에 다운로드
+async function exportPost(id) {
+  const pkg = await buildPackage(id);
+  if (!pkg) return;
+  const { p, blob, name } = pkg;
   const file = new File([blob], name, { type: 'application/zip' });
   p.exported = now();
   await savePost(p);
   toast('패키지 완성', 1500);
-  // 휴대폰이면 공유창(카카오톡·드라이브 등), 안 되면 다운로드
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
     try { await navigator.share({ files: [file], title: name }); render(); return; } catch (e) { if (e.name === 'AbortError') { render(); return; } }
   }
@@ -438,11 +450,126 @@ async function exportPost(id) {
   render();
 }
 
-async function cleanPost(id) {
+/* ================= 구글 드라이브로 바로 올리기 =================
+   앱이 만든 파일만 볼 수 있는 권한(drive.file)만 받는다. */
+const GCLIENT = '285515291872-45vr1o8uj8qdkv8hahpd2ec5q2ihvlq0.apps.googleusercontent.com';
+const GSCOPE = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_FOLDER = '블로그 패키지';
+let gToken = null, gTokenExp = 0, gClient = null, gWait = null;
+
+function loadGis() {
+  if (window.google?.accounts?.oauth2) return Promise.resolve();
+  if (loadGis._p) return loadGis._p;
+  return loadGis._p = new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.onload = res; s.onerror = () => { loadGis._p = null; rej(new Error('구글 로그인 도구를 못 불러왔어요')); };
+    document.head.appendChild(s);
+  });
+}
+// 버튼을 누른 그 순간에 불러야 로그인 창이 막히지 않는다 (await 전에 호출)
+function getToken() {
+  if (gToken && Date.now() < gTokenExp - 60000) return Promise.resolve(gToken);
+  if (!window.google?.accounts?.oauth2) return Promise.reject(new Error('구글 로그인 도구를 아직 못 불러왔어요. 잠시 뒤 다시 눌러 주세요.'));
+  if (!gClient) gClient = google.accounts.oauth2.initTokenClient({
+    client_id: GCLIENT, scope: GSCOPE,
+    callback: r => {
+      const w = gWait; gWait = null;
+      if (r.error || !r.access_token) return w?.rej(new Error('구글 로그인이 취소됐어요'));
+      gToken = r.access_token; gTokenExp = Date.now() + (r.expires_in || 3600) * 1000;
+      w?.res(gToken);
+    },
+    error_callback: e => { const w = gWait; gWait = null; w?.rej(new Error(e?.type === 'popup_closed' ? '구글 로그인 창이 닫혔어요' : '구글 로그인 실패')); },
+  });
+  return new Promise((res, rej) => { gWait = { res, rej }; gClient.requestAccessToken({ prompt: '' }); });
+}
+async function gApi(path, opt = {}) {
+  const r = await fetch('https://www.googleapis.com/drive/v3/' + path, { ...opt, headers: { Authorization: 'Bearer ' + gToken, ...(opt.headers || {}) } });
+  if (!r.ok) throw new Error(`드라이브 응답 오류 ${r.status}`);
+  return r.json();
+}
+async function driveFolder() {
+  let id = localStorage.getItem('driveFolder');
+  if (id) {
+    try { const f = await gApi(`files/${id}?fields=id,trashed`); if (!f.trashed) return id; } catch {}
+  }
+  const q = encodeURIComponent(`name='${DRIVE_FOLDER}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+  const found = await gApi(`files?q=${q}&fields=files(id)&spaces=drive`);
+  id = found.files?.[0]?.id;
+  if (!id) id = (await gApi('files?fields=id', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: DRIVE_FOLDER, mimeType: 'application/vnd.google-apps.folder' }) })).id;
+  localStorage.setItem('driveFolder', id);
+  return id;
+}
+// 끊겨도 이어 올릴 수 있게 8MB씩 나눠 올린다
+async function driveUpload(blob, name, folder, onProg) {
+  const init = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,size,name', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + gToken, 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': 'application/zip', 'X-Upload-Content-Length': String(blob.size) },
+    body: JSON.stringify({ name, parents: [folder], mimeType: 'application/zip' }),
+  });
+  if (!init.ok) throw new Error(`드라이브 업로드 시작 실패 ${init.status}`);
+  const url = init.headers.get('Location');
+  if (!url) throw new Error('드라이브 업로드 주소를 못 받았어요');
+  const CH = 8 * 1048576;
+  let pos = 0, tries = 0;
+  const put = (start, end) => new Promise((res, rej) => {
+    const x = new XMLHttpRequest();
+    x.open('PUT', url);
+    x.setRequestHeader('Content-Range', end > start ? `bytes ${start}-${end - 1}/${blob.size}` : `bytes */${blob.size}`);
+    x.upload.onprogress = e => onProg(start + e.loaded, blob.size);
+    x.onload = () => res(x);
+    x.onerror = () => rej(new Error('네트워크 끊김'));
+    x.send(end > start ? blob.slice(start, end) : null);
+  });
+  while (true) {
+    let x, end = Math.min(pos + CH, blob.size);
+    try { x = await put(pos, end); }
+    catch (e) {
+      if (++tries > 5) throw new Error('인터넷이 계속 끊겨 업로드를 멈췄어요. 와이파이에서 다시 눌러 주세요.');
+      await new Promise(r => setTimeout(r, 2000 * tries));
+      end = null; // 어디까지 받았는지 물어본다
+      try { x = await put(pos, pos); } catch { continue; }
+    }
+    if (x.status === 200 || x.status === 201) return JSON.parse(x.responseText);
+    if (x.status === 308) {
+      const rg = x.getResponseHeader('Range');
+      if (rg) pos = +rg.split('-')[1] + 1;
+      else if (end !== null) pos = end; // 범위 정보를 못 읽으면 보낸 조각은 받은 것으로 본다
+      tries = 0;
+      continue;
+    }
+    if (x.status >= 500 && ++tries <= 5) { await new Promise(r => setTimeout(r, 2000 * tries)); continue; }
+    throw new Error(`드라이브 업로드 실패 ${x.status}`);
+  }
+}
+async function driveSend(id) {
+  const tok = getToken(); // 반드시 첫 줄 (로그인 창)
+  let p;
+  try {
+    await tok;
+    const pkg = await buildPackage(id);
+    if (!pkg) return;
+    p = pkg.p;
+    toast('드라이브 폴더 확인 중…', 60000);
+    const folder = await driveFolder();
+    const f = await driveUpload(pkg.blob, pkg.name, folder, (a, b) => toast(`드라이브에 올리는 중… ${Math.floor(a / b * 100)}% (${mb(a)}/${mb(b)})`, 60000));
+    if (+f.size !== pkg.blob.size) throw new Error('올라간 크기가 달라요. 다시 올려 주세요.');
+    p.exported = now();
+    p.drive = { id: f.id, name: f.name, size: +f.size, at: now() };
+    await savePost(p);
+    toast('드라이브에 올라갔어요 ✓', 2500);
+    render();
+    if (await ask(`드라이브 '${DRIVE_FOLDER}' 폴더에 ${mb(pkg.blob.size)} 다 올라간 것을 확인했어요. 이제 휴대폰에서 사진·영상·녹음 파일을 지워 공간을 비울까요? (장소·날짜·메모와 총평 받아쓰기는 남습니다)`, '🧹 지우기', '나중에')) await cleanPost(id, true);
+  } catch (e) {
+    toast(e.message || String(e), 5000);
+  }
+}
+
+async function cleanPost(id, confirmed) {
   const p = await DB.get('posts', id);
   const all = await DB.mediaOf(id);
   const size = all.reduce((s, m) => s + (m.size || m.blob?.size || 0), 0);
-  if (!(await ask(`PC에 패키지가 잘 옮겨졌나요? 사진·영상·녹음 파일 ${mb(size)}를 지웁니다. 장소·날짜·메모와 총평 받아쓰기는 남습니다.`, '🧹 지우기', '아직'))) return;
+  if (!confirmed && !(await ask(`${p.drive ? '드라이브에 올라간 것을 확인했어요.' : 'PC에 패키지가 잘 옮겨졌나요?'} 사진·영상·녹음 파일 ${mb(size)}를 지웁니다. 장소·날짜·메모와 총평 받아쓰기는 남습니다.`, '🧹 지우기', '아직'))) return;
   for (const m of all) {
     // 녹음은 받아쓰기 글을 남기고 소리 파일만 지운다. 사진·영상은 통째로 지운다.
     if (m.kind === 'audio' && !m.photoId) { m.blob = null; m.size = 0; await DB.put('media', m); }
