@@ -284,8 +284,8 @@ async function saveFiles(postId, files, fromCamera) {
   p.cleaned = false;
   await savePost(p);
   render();
-  // 카메라로 찍으면 바로 녹음 시작 (말할 게 없으면 바로 정지 → 1초 미만은 버림)
-  if (fromCamera && last && !rec) {
+  // 카메라로 찍으면 녹음할지 묻고, 예를 누르면 바로 녹음 시작 (1초 미만은 버림)
+  if (fromCamera && last && !rec && confirm(`${last.kind === 'video' ? '영상' : '사진'} 설명을 녹음할까요?`)) {
     await toggleRec(postId, last.id, `${pad2(p.order.length)}번 ${last.kind === 'video' ? '영상' : '사진'} 설명 — 말하고 정지`);
   } else toast(`${files.length}개를 저장했어요`);
 }
