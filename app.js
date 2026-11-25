@@ -542,9 +542,14 @@ async function driveUpload(blob, name, folder, onProg) {
     throw new Error(`드라이브 업로드 실패 ${x.status}`);
   }
 }
+let driveBusy = false;
 async function driveSend(id) {
-  const tok = getToken(); // 반드시 첫 줄 (로그인 창)
+  if (driveBusy) return toast('이미 올리는 중이에요. 잠시만 기다려 주세요.');
+  driveBusy = true;
+  const tok = getToken(); // 로그인 창은 버튼 누른 직후에 열어야 막히지 않는다
   let p;
+  const btn = $('#drive');
+  if (btn) { btn.disabled = true; btn.textContent = '☁️ 올리는 중…'; }
   try {
     await tok;
     const pkg = await buildPackage(id);
@@ -562,6 +567,10 @@ async function driveSend(id) {
     if (await ask(`드라이브 '${DRIVE_FOLDER}' 폴더에 ${mb(pkg.blob.size)} 다 올라간 것을 확인했어요. 이제 휴대폰에서 사진·영상·녹음 파일을 지워 공간을 비울까요? (장소·날짜·메모와 총평 받아쓰기는 남습니다)`, '🧹 지우기', '나중에')) await cleanPost(id, true);
   } catch (e) {
     toast(e.message || String(e), 5000);
+  } finally {
+    driveBusy = false;
+    const b = $('#drive');
+    if (b) { b.disabled = false; b.textContent = '☁️ 구글 드라이브에 올리기'; }
   }
 }
 
